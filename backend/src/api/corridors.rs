@@ -355,7 +355,6 @@ pub async fn list_corridors(
             let circuit_breaker = rpc_circuit_breaker();
 
             // **RPC DATA**: Fetch recent payments with pagination to identify active corridors
-            // Use paginated fetch to get more complete data (up to configured limit)
             let payments = with_retry(
                 || async {
                     rpc_client
