@@ -4,8 +4,21 @@ mod errors;
 mod events;
 
 use errors::Error;
-use events::emit_snapshot_submitted;
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map};
+use events::{emit_contract_initialized, emit_contract_paused, emit_contract_unpaused, emit_snapshot_submitted};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Map, String};
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// ~30 days at 5 s/ledger
+const LEDGERS_TO_EXTEND: u32 = 518_400;
+const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
+const INSTANCE_TTL_EXTEND: u32 = 518_400;
+
+fn bump_instance(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+}
 
 /// Storage keys for persistent contract data
 #[contracttype]
@@ -19,6 +32,8 @@ pub enum DataKey {
     LatestEpoch,
     /// Emergency pause state (true = paused, false = active)
     Paused,
+    /// Contract package version at initialization
+    Version,
 }
 
 /// Analytics snapshot data structure
@@ -31,6 +46,37 @@ pub struct Snapshot {
     pub epoch: u64,
     /// Ledger timestamp when recorded
     pub timestamp: u64,
+}
+
+/// Extended contract metadata for public disclosure
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PublicMetadata {
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub repository: String,
+    pub license: String,
+}
+
+/// Represents an optional admin address in contract info
+#[contracttype]
+#[derive(Clone, Debug)]
+pub enum MaybeAddress {
+    None,
+    Some(Address),
+}
+
+/// Contract info combining metadata with runtime state
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ContractInfo {
+    pub metadata: PublicMetadata,
+    pub initialized: bool,
+    pub paused: bool,
+    pub admin: MaybeAddress,
+    pub total_snapshots: u64,
 }
 
 #[contract]
@@ -60,7 +106,23 @@ impl StellarInsightsContract {
 
         // Initialize contract as not paused
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &String::from_str(&env, VERSION));
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND);
+
+        emit_contract_initialized(&env, admin);
+
         Ok(())
+    }
+
+    pub fn get_version(env: Env) -> String {
+        env.storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or_else(|| String::from_str(&env, VERSION))
     }
 
     /// Submit a cryptographic hash of an analytics snapshot on-chain
@@ -159,6 +221,13 @@ impl StellarInsightsContract {
             .persistent()
             .set(&DataKey::Snapshots, &snapshots);
 
+        // Extend storage TTL (~30 days at 5s per ledger)
+        env.storage().persistent().extend_ttl(
+            &DataKey::Snapshots,
+            LEDGERS_TO_EXTEND,
+            LEDGERS_TO_EXTEND,
+        );
+
         env.storage().instance().set(&DataKey::LatestEpoch, &epoch);
 
         // Emit structured event for off-chain indexing
@@ -184,6 +253,14 @@ impl StellarInsightsContract {
     /// # Returns
     /// * The 32-byte hash stored for that epoch
     pub fn get_snapshot(env: Env, epoch: u64) -> Result<BytesN<32>, Error> {
+        // Extend TTL on read to keep data alive
+        if env.storage().persistent().has(&DataKey::Snapshots) {
+            env.storage().persistent().extend_ttl(
+                &DataKey::Snapshots,
+                LEDGERS_TO_EXTEND,
+                LEDGERS_TO_EXTEND,
+            );
+        }
         let snapshots: Map<u64, Snapshot> = env
             .storage()
             .persistent()
@@ -215,6 +292,14 @@ impl StellarInsightsContract {
 
         if latest_epoch == 0 {
             return Err(Error::SnapshotNotFound);
+        }
+
+        if env.storage().persistent().has(&DataKey::Snapshots) {
+            env.storage().persistent().extend_ttl(
+                &DataKey::Snapshots,
+                LEDGERS_TO_EXTEND,
+                LEDGERS_TO_EXTEND,
+            );
         }
 
         let snapshots: Map<u64, Snapshot> = env
@@ -270,7 +355,7 @@ impl StellarInsightsContract {
     ///
     /// # Errors
     /// * `Error::AdminNotSet` - If admin was not initialized
-    /// * `Error::UnauthorizedCaller` - If caller is not the admin
+    /// * `Error::Unauthorized` - If caller is not the admin
     pub fn pause(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
 
@@ -281,10 +366,14 @@ impl StellarInsightsContract {
             .ok_or(Error::AdminNotSet)?;
 
         if caller != admin {
-            return Err(Error::UnauthorizedCaller);
+            return Err(Error::Unauthorized);
         }
 
         env.storage().instance().set(&DataKey::Paused, &true);
+        bump_instance(&env);
+
+        emit_contract_paused(&env, caller);
+
         Ok(())
     }
 
@@ -298,7 +387,7 @@ impl StellarInsightsContract {
     ///
     /// # Errors
     /// * `Error::AdminNotSet` - If admin was not initialized
-    /// * `Error::UnauthorizedCaller` - If caller is not the admin
+    /// * `Error::Unauthorized` - If caller is not the admin
     pub fn unpause(env: Env, caller: Address) -> Result<(), Error> {
         caller.require_auth();
 
@@ -309,10 +398,14 @@ impl StellarInsightsContract {
             .ok_or(Error::AdminNotSet)?;
 
         if caller != admin {
-            return Err(Error::UnauthorizedCaller);
+            return Err(Error::Unauthorized);
         }
 
         env.storage().instance().set(&DataKey::Paused, &false);
+        bump_instance(&env);
+
+        emit_contract_unpaused(&env, caller);
+
         Ok(())
     }
 
@@ -328,6 +421,54 @@ impl StellarInsightsContract {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // =========================================================================
+    // Contract Metadata
+    // =========================================================================
+
+    /// Get public contract metadata
+    pub fn get_metadata(env: Env) -> PublicMetadata {
+        PublicMetadata {
+            name: String::from_str(&env, "Stellar Insights Core"),
+            version: String::from_str(&env, VERSION),
+            author: String::from_str(&env, "Stellar Insights Team"),
+            description: String::from_str(
+                &env,
+                "Core analytics snapshot contract for Stellar network",
+            ),
+            repository: String::from_str(&env, "https://github.com/stellar-insights/contracts"),
+            license: String::from_str(&env, "MIT"),
+        }
+    }
+
+    /// Get comprehensive contract information
+    pub fn get_contract_info(env: Env) -> ContractInfo {
+        let initialized = env.storage().instance().has(&DataKey::Admin);
+        let admin = if initialized {
+            match env.storage().instance().get(&DataKey::Admin) {
+                Some(addr) => MaybeAddress::Some(addr),
+                None => MaybeAddress::None,
+            }
+        } else {
+            MaybeAddress::None
+        };
+
+        ContractInfo {
+            metadata: Self::get_metadata(env.clone()),
+            initialized,
+            paused: env
+                .storage()
+                .instance()
+                .get(&DataKey::Paused)
+                .unwrap_or(false),
+            admin,
+            total_snapshots: env
+                .storage()
+                .instance()
+                .get(&DataKey::LatestEpoch)
+                .unwrap_or(0),
+        }
     }
 }
 
